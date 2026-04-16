@@ -1,0 +1,478 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include <cstring>
+#include <cstdio>
+#include "display.h"
+#include "matrix_keypad.h"
+#include "motor.h"
+
+#define SYSTEM_TIME_INCREMENT_MS      10
+#define DISPLAY_REFRESH_TIME_MS      200
+#define TEMP_MESSAGE_TIME_MS        1500
+#define GATE_OPEN_TIME_MS           4000
+#define GATE_CLOSE_TIME_MS          4000
+#define AUTO_REARM_TIME_MS        45000
+#define PIR_SENSOR_PIN              PG_0
+
+typedef enum {
+    MODE_MANUAL,
+    MODE_AUTO
+} systemMode_t;
+
+typedef enum {
+    GATE_CLOSED,
+    GATE_OPENING,
+    GATE_OPEN,
+    GATE_CLOSING
+} gateState_t;
+
+InterruptIn pirSensor( PIR_SENSOR_PIN );
+
+static volatile bool pirDetectedEvent = false;
+static systemMode_t currentMode = MODE_MANUAL;
+static gateState_t gateState = GATE_CLOSED;
+static int displayRefreshCounter = 0;
+static int temporaryMessageCounter = 0;
+static int gateMotionCounter = 0;
+static int autoWaitCounter = 0;
+static bool temporaryMessageActive = false;
+static bool gateOpenedByPir = false;
+static bool autoCloseReady = false;
+static char temporaryMessage[21] = "";
+static char lastStatusLine0[64] = "";
+static char lastStatusLine1[64] = "";
+static char lastStatusLine2[64] = "";
+static char lastStatusLine3[64] = "";
+
+static void displayWriteLine( int row, const char * text );
+static void displayBaseScreen();
+static void displayTemporaryMessage( const char * text );
+
+static void serialWriteStatusLines(
+    const char * line0,
+    const char * line1,
+    const char * line2,
+    const char * line3
+);
+
+static void serialWriteTemporaryMessage( const char * text );
+
+static const char* modeToString( systemMode_t mode );
+static const char* gateStateToString( gateState_t state );
+static const char* motorDirectionToString( motorDirection_t direction );
+
+static void startGateOpening();
+static void startGateClosing();
+
+static void setManualMode();
+static void setAutoMode();
+static void toggleMode();
+
+static void handleKeypad( char keyReleased );
+static void handlePirEvent();
+static void updateGateTimerState();
+static void updateAutoModeTimer();
+
+static void pirSensorISR();
+
+static void displayWriteLine( int row, const char * text )
+{
+    char buffer[21];
+    int i = 0;
+
+    while ( text[i] != '\0' && i < 20 ) {
+        buffer[i] = text[i];
+        i++;
+    }
+
+    while ( i < 20 ) {
+        buffer[i] = ' ';
+        i++;
+    }
+
+    buffer[20] = '\0';
+
+    displayCharPositionWrite( 0, row );
+    displayStringWrite( buffer );
+}
+
+static void serialWriteStatusLines(
+    const char * line0,
+    const char * line1,
+    const char * line2,
+    const char * line3
+)
+{
+    if (
+        strcmp( line0, lastStatusLine0 ) != 0 ||
+        strcmp( line1, lastStatusLine1 ) != 0 ||
+        strcmp( line2, lastStatusLine2 ) != 0 ||
+        strcmp( line3, lastStatusLine3 ) != 0
+    ) {
+        printf( "\r\n====================\r\n" );
+        printf( "%s\r\n", line0 );
+        printf( "%s\r\n", line1 );
+        printf( "%s\r\n", line2 );
+        printf( "%s\r\n", line3 );
+        printf( "====================\r\n" );
+
+        strncpy( lastStatusLine0, line0, sizeof(lastStatusLine0) - 1 );
+        strncpy( lastStatusLine1, line1, sizeof(lastStatusLine1) - 1 );
+        strncpy( lastStatusLine2, line2, sizeof(lastStatusLine2) - 1 );
+        strncpy( lastStatusLine3, line3, sizeof(lastStatusLine3) - 1 );
+
+        lastStatusLine0[sizeof(lastStatusLine0) - 1] = '\0';
+        lastStatusLine1[sizeof(lastStatusLine1) - 1] = '\0';
+        lastStatusLine2[sizeof(lastStatusLine2) - 1] = '\0';
+        lastStatusLine3[sizeof(lastStatusLine3) - 1] = '\0';
+    }
+}
+
+static void serialWriteTemporaryMessage( const char * text )
+{
+    printf( "Event: %s\r\n", text );
+}
+
+static const char* modeToString( systemMode_t mode )
+{
+    switch ( mode ) {
+        case MODE_AUTO:
+            return "Auto";
+        case MODE_MANUAL:
+        default:
+            return "Manual";
+    }
+}
+
+static const char* gateStateToString( gateState_t state )
+{
+    switch ( state ) {
+        case GATE_CLOSED:
+            return "Closed";
+        case GATE_OPENING:
+            return "Opening";
+        case GATE_OPEN:
+            return "Open";
+        case GATE_CLOSING:
+            return "Closing";
+        default:
+            return "Unknown";
+    }
+}
+
+static const char* motorDirectionToString( motorDirection_t direction )
+{
+    switch ( direction ) {
+        case DIRECTION_1:
+            return "On-Open";
+        case DIRECTION_2:
+            return "On-Close";
+        case STOPPED:
+        default:
+            return "Stopped";
+    }
+}
+
+static void displayBaseScreen()
+{
+    char line0[21];
+    char line1[21];
+    char line2[21];
+    char line3[21];
+
+    snprintf( line0, sizeof(line0), "Mode: %s", modeToString( currentMode ) );
+    snprintf( line1, sizeof(line1), "Gate: %s", gateStateToString( gateState ) );
+    snprintf( line2, sizeof(line2), "Motor:%s", motorDirectionToString( motorDirectionRead() ) );
+
+    if ( currentMode == MODE_AUTO &&
+         gateState == GATE_OPEN &&
+         gateOpenedByPir &&
+         !autoCloseReady ) {
+
+        int secondsRemaining = ( AUTO_REARM_TIME_MS - autoWaitCounter + 999 ) / 1000;
+        if ( secondsRemaining < 0 ) {
+            secondsRemaining = 0;
+        }
+
+        snprintf( line3, sizeof(line3), "Close in: %2ds", secondsRemaining );
+
+    } else if ( currentMode == MODE_AUTO &&
+                gateState == GATE_OPEN &&
+                gateOpenedByPir &&
+                autoCloseReady ) {
+
+        snprintf( line3, sizeof(line3), "PIR closes gate" );
+
+    } else {
+        snprintf( line3, sizeof(line3), "1=O 2=C 4=Mode" );
+    }
+
+    displayWriteLine( 0, line0 );
+    displayWriteLine( 1, line1 );
+    displayWriteLine( 2, line2 );
+
+    if ( !temporaryMessageActive ) {
+        displayWriteLine( 3, line3 );
+    }
+
+    serialWriteStatusLines( line0, line1, line2, line3 );
+}
+
+static void displayTemporaryMessage( const char * text )
+{
+    strncpy( temporaryMessage, text, 20 );
+    temporaryMessage[20] = '\0';
+
+    displayWriteLine( 3, temporaryMessage );
+    temporaryMessageActive = true;
+    temporaryMessageCounter = 0;
+
+    serialWriteTemporaryMessage( text );
+}
+
+static void startGateOpening()
+{
+    if ( gateState == GATE_OPEN || gateState == GATE_OPENING ) {
+        displayTemporaryMessage( "Gate already open" );
+        return;
+    }
+
+    motorDirectionWrite( DIRECTION_1 );
+    gateState = GATE_OPENING;
+    gateMotionCounter = 0;
+    displayTemporaryMessage( "Gate opening..." );
+}
+
+static void startGateClosing()
+{
+    if ( gateState == GATE_CLOSED || gateState == GATE_CLOSING ) {
+        displayTemporaryMessage( "Gate already closed" );
+        return;
+    }
+
+    motorDirectionWrite( DIRECTION_2 );
+    gateState = GATE_CLOSING;
+    gateMotionCounter = 0;
+    displayTemporaryMessage( "Gate closing..." );
+}
+
+static void setManualMode()
+{
+    currentMode = MODE_MANUAL;
+    gateOpenedByPir = false;
+    autoCloseReady = false;
+    autoWaitCounter = 0;
+    displayTemporaryMessage( "Mode set: Manual" );
+}
+
+static void setAutoMode()
+{
+    currentMode = MODE_AUTO;
+    gateOpenedByPir = false;
+    autoCloseReady = false;
+    autoWaitCounter = 0;
+    displayTemporaryMessage( "Mode set: Auto" );
+}
+
+static void toggleMode()
+{
+    if ( currentMode == MODE_MANUAL ) {
+        setAutoMode();
+    } else {
+        setManualMode();
+    }
+}
+
+static void handleKeypad( char keyReleased )
+{
+    switch ( keyReleased ) {
+
+        case '1':
+            gateOpenedByPir = false;
+            autoCloseReady = false;
+            autoWaitCounter = 0;
+            startGateOpening();
+            break;
+
+        case '2':
+            gateOpenedByPir = false;
+            autoCloseReady = false;
+            autoWaitCounter = 0;
+            startGateClosing();
+            break;
+
+        case '4':
+            toggleMode();
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void handlePirEvent()
+{
+    pirDetectedEvent = false;
+
+    if ( currentMode == MODE_MANUAL ) {
+        displayTemporaryMessage( "PIR ignored" );
+        return;
+    }
+
+    if ( gateState == GATE_CLOSED || gateState == GATE_CLOSING ) {
+        startGateOpening();
+        gateOpenedByPir = true;
+        autoCloseReady = false;
+        autoWaitCounter = 0;
+        displayTemporaryMessage( "PIR opened gate" );
+        return;
+    }
+
+    if ( gateState == GATE_OPENING ) {
+        displayTemporaryMessage( "PIR: opening" );
+        return;
+    }
+
+    if ( gateState == GATE_OPEN ) {
+        if ( gateOpenedByPir && autoCloseReady ) {
+            startGateClosing();
+            gateOpenedByPir = false;
+            autoCloseReady = false;
+            autoWaitCounter = 0;
+            displayTemporaryMessage( "PIR closed gate" );
+        }
+    }
+}
+
+static void updateGateTimerState()
+{
+    if ( gateState == GATE_OPENING ) {
+
+        gateMotionCounter += SYSTEM_TIME_INCREMENT_MS;
+
+        if ( gateMotionCounter >= GATE_OPEN_TIME_MS ) {
+            motorDirectionWrite( STOPPED );
+            gateState = GATE_OPEN;
+            gateMotionCounter = 0;
+
+            if ( currentMode == MODE_AUTO && gateOpenedByPir ) {
+                autoCloseReady = false;
+                autoWaitCounter = 0;
+            }
+
+            displayTemporaryMessage( "Gate open" );
+        }
+
+    } else if ( gateState == GATE_CLOSING ) {
+
+        gateMotionCounter += SYSTEM_TIME_INCREMENT_MS;
+
+        if ( gateMotionCounter >= GATE_CLOSE_TIME_MS ) {
+            motorDirectionWrite( STOPPED );
+            gateState = GATE_CLOSED;
+            gateMotionCounter = 0;
+            gateOpenedByPir = false;
+            autoCloseReady = false;
+            autoWaitCounter = 0;
+            displayTemporaryMessage( "Gate closed" );
+        }
+
+    } else {
+        gateMotionCounter = 0;
+    }
+}
+
+static void updateAutoModeTimer()
+{
+    if ( currentMode == MODE_AUTO && gateState == GATE_OPEN && gateOpenedByPir && !autoCloseReady ) {
+        autoWaitCounter += SYSTEM_TIME_INCREMENT_MS;
+
+        if ( autoWaitCounter >= AUTO_REARM_TIME_MS ) {
+            autoCloseReady = true;
+            temporaryMessageActive = false;
+        }
+    } else if ( !autoCloseReady ) {
+        autoWaitCounter = 0;
+    }
+}
+
+static void pirSensorISR()
+{
+    pirDetectedEvent = true;
+}
+
+int main()
+{
+    char keyReleased = '\0';
+
+    displayInit(
+        DISPLAY_TYPE_LCD_HD44780,
+        DISPLAY_CONNECTION_I2C_PCF8574_IO_EXPANDER
+    );
+
+    displayClear();
+
+    matrixKeypadInit( SYSTEM_TIME_INCREMENT_MS );
+    motorControlInit();
+
+    pirSensor.mode( PullDown );
+    pirSensor.rise( &pirSensorISR );
+
+    printf( "\r\nLab 7 Main Task 7 Started\r\n" );
+    printf( "System: LCD + Serial Monitor Active\r\n" );
+    printf( "Keypad: 1=Open 2=Close 4=Mode\r\n" );
+
+    displayWriteLine( 0, "Lab 7 Main Task 7" );
+    displayWriteLine( 1, "LCD + Serial Sync" );
+    displayWriteLine( 2, "Mode: Manual" );
+    displayWriteLine( 3, "Starting..." );
+    delay( 1200 );
+
+    gateState = GATE_CLOSED;
+    currentMode = MODE_MANUAL;
+    gateOpenedByPir = false;
+    autoCloseReady = false;
+    autoWaitCounter = 0;
+
+    lastStatusLine0[0] = '\0';
+    lastStatusLine1[0] = '\0';
+    lastStatusLine2[0] = '\0';
+    lastStatusLine3[0] = '\0';
+
+    while ( true ) {
+
+        motorControlUpdate();
+
+        keyReleased = matrixKeypadUpdate();
+
+        if ( keyReleased != '\0' ) {
+            handleKeypad( keyReleased );
+        }
+
+        if ( pirDetectedEvent ) {
+            handlePirEvent();
+        }
+
+        updateGateTimerState();
+        updateAutoModeTimer();
+
+        if ( displayRefreshCounter >= DISPLAY_REFRESH_TIME_MS ) {
+            displayRefreshCounter = 0;
+            displayBaseScreen();
+        } else {
+            displayRefreshCounter += SYSTEM_TIME_INCREMENT_MS;
+        }
+
+        if ( temporaryMessageActive ) {
+            if ( temporaryMessageCounter >= TEMP_MESSAGE_TIME_MS ) {
+                temporaryMessageCounter = 0;
+                temporaryMessageActive = false;
+                displayBaseScreen();
+            } else {
+                temporaryMessageCounter += SYSTEM_TIME_INCREMENT_MS;
+            }
+        }
+
+        delay( SYSTEM_TIME_INCREMENT_MS );
+    }
+}
