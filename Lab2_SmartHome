@@ -1,0 +1,170 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+#define DEBOUNCE_MS   30
+#define WARNING_SEC   30
+#define LOCKDOWN_SEC  60
+
+static const int USER_CODE[4]  = {1, 2, 3, 4};
+static const int ADMIN_CODE[4] = {5, 5, 0, 1};
+
+void show_counter_on_leds(DigitalOut &led1, DigitalOut &led2, DigitalOut &led3, int count)
+{
+    int c = count & 0x07;
+    led1 = (c >> 0) & 1;
+    led2 = (c >> 1) & 1;
+    led3 = (c >> 2) & 1;
+}
+
+bool match_code(const int a[4], const int b[4])
+{
+    for (int i = 0; i < 4; i++) {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+
+int read_digit_blocking(DigitalIn &d2, DigitalIn &d3, DigitalIn &d4,
+                        DigitalIn &d5, DigitalIn &d6, DigitalIn &d7)
+{
+    while (true) {
+        if (d2.read()) { ThisThread::sleep_for(DEBOUNCE_MS * 1ms); if (d2.read()) { while (d2.read()) {} return 0; } }
+        if (d3.read()) { ThisThread::sleep_for(DEBOUNCE_MS * 1ms); if (d3.read()) { while (d3.read()) {} return 1; } }
+        if (d4.read()) { ThisThread::sleep_for(DEBOUNCE_MS * 1ms); if (d4.read()) { while (d4.read()) {} return 2; } }
+        if (d5.read()) { ThisThread::sleep_for(DEBOUNCE_MS * 1ms); if (d5.read()) { while (d5.read()) {} return 3; } }
+        if (d6.read()) { ThisThread::sleep_for(DEBOUNCE_MS * 1ms); if (d6.read()) { while (d6.read()) {} return 4; } }
+        if (d7.read()) { ThisThread::sleep_for(DEBOUNCE_MS * 1ms); if (d7.read()) { while (d7.read()) {} return 5; } }
+
+        ThisThread::sleep_for(5ms);
+    }
+}
+
+void read_code4(int out[4],
+                DigitalIn &d2, DigitalIn &d3, DigitalIn &d4,
+                DigitalIn &d5, DigitalIn &d6, DigitalIn &d7)
+{
+    for (int i = 0; i < 4; i++) {
+        out[i] = read_digit_blocking(d2, d3, d4, d5, d6, d7);
+    }
+}
+
+int main()
+{
+    DigitalIn b1(BUTTON1); 
+    DigitalIn d2(D2);
+    DigitalIn d3(D3);
+    DigitalIn d4(D4);
+    DigitalIn d5(D5);
+    DigitalIn d6(D6);
+    DigitalIn d7(D7);
+
+    DigitalOut led1(LED1);
+    DigitalOut led2(LED2);
+    DigitalOut led3(LED3);
+
+    b1.mode(PullDown);
+    d2.mode(PullDown);
+    d3.mode(PullDown);
+    d4.mode(PullDown);
+    d5.mode(PullDown);
+    d6.mode(PullDown);
+    d7.mode(PullDown);
+
+    led1 = OFF; led2 = OFF; led3 = OFF;
+
+    enum { NORMAL, WARNING, LOCKDOWN } state = NORMAL;
+
+    int entered[4] = {-1, -1, -1, -1};
+    int wrong_count = 0;
+
+    bool warning_just_finished = false;  
+    int lockdown_events = 0;             
+
+    show_counter_on_leds(led1, led2, led3, lockdown_events);
+
+    while (true) {
+
+        if (state == NORMAL) {
+
+            show_counter_on_leds(led1, led2, led3, lockdown_events);
+
+            read_code4(entered, d2, d3, d4, d5, d6, d7);
+
+            if (match_code(entered, USER_CODE)) {
+                wrong_count = 0;
+                warning_just_finished = false;
+
+                led1 = ON; led2 = ON; led3 = ON;
+                ThisThread::sleep_for(200ms);
+
+            } else {
+                wrong_count++;
+
+                if (warning_just_finished) {
+                    warning_just_finished = false;
+
+                    lockdown_events = (lockdown_events + 1) & 0x07;
+                    state = LOCKDOWN;
+
+                } else if (wrong_count >= 3) {
+                    state = WARNING;
+
+                } else {
+                    led3 = ON;
+                    ThisThread::sleep_for(150ms);
+                }
+            }
+
+            show_counter_on_leds(led1, led2, led3, lockdown_events);
+        }
+
+        else if (state == WARNING) {
+
+            Timer t;
+            t.start();
+
+            led1 = OFF; led3 = OFF;
+            while (t.elapsed_time() < WARNING_SEC * 1s) {
+                led2 = !led2;
+                ThisThread::sleep_for(500ms);
+            }
+            led2 = OFF;
+
+            warning_just_finished = true;
+            state = NORMAL;
+
+            show_counter_on_leds(led1, led2, led3, lockdown_events);
+        }
+
+        else if (state == LOCKDOWN) {
+
+            Timer t;
+            t.start();
+
+            while (true) {
+
+                led3 = ON;       
+                led2 = !led2;    
+                ThisThread::sleep_for(300ms);
+
+
+                read_code4(entered, d2, d3, d4, d5, d6, d7);
+
+                if (match_code(entered, ADMIN_CODE)) {
+                    led2 = OFF; led3 = OFF;
+                    wrong_count = 0;
+                    warning_just_finished = false;
+
+                    state = NORMAL;
+                    show_counter_on_leds(led1, led2, led3, lockdown_events);
+                    break;
+                }
+
+
+                if (t.elapsed_time() >= LOCKDOWN_SEC * 1s) {
+                    t.stop();
+                }
+            }
+        }
+    }
+}
