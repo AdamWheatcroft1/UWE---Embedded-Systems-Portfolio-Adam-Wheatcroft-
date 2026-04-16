@@ -1,1 +1,30 @@
+#include "mbed.h"
 
+int main()
+{
+    DigitalOut led1(LED1);
+    DigitalOut led2(LED2);
+    DigitalOut led3(LED3);
+
+    const auto blink_time = 200ms;
+
+    for (int i = 0; i < 5; i++) {
+        led1 = 1;
+        led2 = 1;
+        led3 = 1;
+        ThisThread::sleep_for(blink_time);
+
+        led1 = 0;
+        led2 = 0;
+        led3 = 0;
+        ThisThread::sleep_for(blink_time);
+    }
+
+    led1 = 1;
+    led2 = 0;
+    led3 = 0;
+
+    while (true) {
+        ThisThread::sleep_for(1000ms);
+    }
+}
