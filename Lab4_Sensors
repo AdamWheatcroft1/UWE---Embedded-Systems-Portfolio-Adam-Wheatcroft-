@@ -1,0 +1,239 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+
+UnbufferedSerial uartUsb(USBTX, USBRX, 115200);
+
+AnalogIn potentiometer(A0);   
+AnalogIn lm35(A1);              
+DigitalIn mq2(PE_12);           
+
+DigitalOut alarmLed(LED1);      
+
+PwmOut piezo(PE_10);
+
+DigitalIn btnGasSim(D2);
+DigitalIn btnTempSim(D3);
+DigitalIn btnA(D4);
+DigitalIn btnB(D5);
+DigitalIn btnEnter(BUTTON1);
+
+static constexpr chrono::milliseconds PRINT_PERIOD{200};
+static constexpr chrono::milliseconds GAS_SAMPLE_PERIOD{20};
+
+static constexpr chrono::milliseconds BLINK_GAS{1000};
+static constexpr chrono::milliseconds BLINK_TEMP{500};
+static constexpr chrono::milliseconds BLINK_BOTH{100};
+
+static void pcPrint(const char *str)
+{
+    uartUsb.write(str, strlen(str));
+}
+
+static void pcPrintf(const char *fmt, ...)
+{
+    char buffer[240];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    uartUsb.write(buffer, strlen(buffer));
+}
+
+static int potTo0_100(float x)
+{
+    if (x < 0.0f) x = 0.0f;
+    if (x > 1.0f) x = 1.0f;
+    return (int)(x * 100.0f + 0.5f);
+}
+
+static float readLm35TempC()
+{
+    float voltage = lm35.read() * 3.3f;
+    return voltage / 0.01f;
+}
+
+static float cToF(float c)
+{
+    return (c * 9.0f / 5.0f) + 32.0f;
+}
+
+static float sensitivityToTempThresholdC(int sens)
+{
+    const float tMin = 30.0f;
+    const float tMax = 70.0f;
+    float s = sens / 100.0f;
+    return tMin + (tMax - tMin) * s;
+}
+
+static int sensitivityToGasRequiredHits(int sens)
+{
+
+    int hits = 10 - (sens * 9) / 100;
+    if (hits < 1) hits = 1;
+    if (hits > 10) hits = 10;
+    return hits;
+}
+
+static bool gasDetectedNow()
+{
+    return (mq2.read() == 0);
+}
+
+static void piezoInit()
+{
+    piezo.write(0.0f); 
+}
+
+static void piezoToneOn(float freq_hz, float duty = 0.5f)
+{
+    if (freq_hz < 50.0f) freq_hz = 50.0f;
+    if (duty < 0.0f) duty = 0.0f;
+    if (duty > 1.0f) duty = 1.0f;
+
+    piezo.period(1.0f / freq_hz);
+    piezo.write(duty);
+}
+
+static void piezoOff()
+{
+    piezo.write(0.0f);
+}
+
+static void buttonsInit()
+{
+    btnGasSim.mode(PullDown);
+    btnTempSim.mode(PullDown);
+    btnA.mode(PullDown);
+    btnB.mode(PullDown);
+    btnEnter.mode(PullDown);
+}
+
+static bool clearComboPressed()
+{
+    return (btnA.read() && btnB.read() && btnEnter.read());
+}
+
+int main()
+{
+    piezoInit();
+    buttonsInit();
+
+    pcPrint("\r\nStartup: piezo test (2 kHz for 2 seconds)\r\n");
+    piezoToneOn(2000.0f, 0.5f);
+    ThisThread::sleep_for(2000ms);
+    piezoOff();
+
+    pcPrint("\r\n--- Lab 4 : Main Task 4 (Final) ---\r\n");
+    pcPrint("Serial: 115200 baud\r\n");
+    pcPrint("Pins: Pot=A0, LM35=A1, MQ2 DOUT=PE_12, Piezo PWM=PE_10, LED=LD1\r\n");
+    pcPrint("Piezo wiring: PE_10 -> piezo -> GND\r\n");
+    pcPrint("Button sim: D2=gas, D3=temp, clear=D4+D5+USER (optional)\r\n\r\n");
+
+    bool gasWarn = false;
+    bool tempWarn = false;
+
+    bool simGas = false;
+    bool simTemp = false;
+
+    int gasCount = 0;
+
+    chrono::milliseconds blinkPeriod = 0ms;
+    Timer ledTimer;
+    ledTimer.start();
+    int64_t lastLedToggleMs = 0;
+
+    Timer t;
+    t.start();
+    int64_t lastGasSampleMs = 0;
+    int64_t lastPrintMs = 0;
+
+    while (true)
+    {
+        int64_t nowMs = chrono::duration_cast<chrono::milliseconds>(t.elapsed_time()).count();
+
+        if (btnGasSim.read())  simGas  = true;
+        if (btnTempSim.read()) simTemp = true;
+        if (clearComboPressed()) { simGas = false; simTemp = false; }
+
+        float potRaw = potentiometer.read();
+        int sensitivity = potTo0_100(potRaw);
+
+        if ((nowMs - lastGasSampleMs) >= (int64_t)GAS_SAMPLE_PERIOD.count())
+        {
+            lastGasSampleMs = nowMs;
+
+            int requiredHits = sensitivityToGasRequiredHits(sensitivity);
+
+            bool gasNow = gasDetectedNow();
+
+            if (gasNow) {
+                if (gasCount < 50) gasCount++;
+            } else {
+                if (gasCount > 0) gasCount--;
+            }
+
+            gasWarn = (gasCount >= requiredHits);
+        }
+
+        float tempC = readLm35TempC();
+        float tempF = cToF(tempC);
+        float thrC  = sensitivityToTempThresholdC(sensitivity);
+        tempWarn = (tempC > thrC);
+
+        bool finalGasWarn  = gasWarn  || simGas;
+        bool finalTempWarn = tempWarn || simTemp;
+
+        bool alarmActive = (finalGasWarn || finalTempWarn);
+
+        if (finalGasWarn && finalTempWarn)      blinkPeriod = BLINK_BOTH;
+        else if (finalTempWarn)                 blinkPeriod = BLINK_TEMP;
+        else if (finalGasWarn)                  blinkPeriod = BLINK_GAS;
+        else                                    blinkPeriod = 0ms;
+
+        if (blinkPeriod.count() == 0) {
+            alarmLed = 0;
+        } else {
+            int64_t ledNowMs = chrono::duration_cast<chrono::milliseconds>(ledTimer.elapsed_time()).count();
+            if ((ledNowMs - lastLedToggleMs) >= blinkPeriod.count()) {
+                lastLedToggleMs = ledNowMs;
+                alarmLed = !alarmLed;
+            }
+        }
+
+        if (alarmActive) {
+            piezoToneOn(2000.0f, 0.5f); 
+        } else {
+            piezoOff();
+        }
+
+        if ((nowMs - lastPrintMs) >= (int64_t)PRINT_PERIOD.count())
+        {
+            lastPrintMs = nowMs;
+
+            if (alarmActive) {
+                if (finalGasWarn && finalTempWarn) {
+                    pcPrint("Buzzer ON - Cause: Temperature & Gas | ");
+                } else if (finalTempWarn) {
+                    pcPrint("Buzzer ON - Cause: Temperature | ");
+                } else {
+                    pcPrint("Buzzer ON - Cause: Gas | ");
+                }
+            } else {
+                pcPrint("System Normal | ");
+            }
+
+            int requiredHits = sensitivityToGasRequiredHits(sensitivity);
+
+            pcPrintf("Pot=%.2f (Sens=%d/100), Temp=%.1fC (%.1fF), Thr=%.1fC, ",
+                     potRaw, sensitivity, tempC, tempF, thrC);
+
+            pcPrintf("GasDOUT=%d, GasCount=%d/%d, Sim(G=%d,T=%d)\r\n",
+                     mq2.read(), gasCount, requiredHits, (int)simGas, (int)simTemp);
+        }
+
+        ThisThread::sleep_for(5ms);
+    }
+}
