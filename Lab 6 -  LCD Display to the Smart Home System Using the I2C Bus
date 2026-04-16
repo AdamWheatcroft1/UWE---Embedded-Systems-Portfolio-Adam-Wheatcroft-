@@ -1,0 +1,303 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include <cstdio>
+#include <cstring>
+#include "display.h"
+#include "matrix_keypad.h"
+
+#define TIME_INCREMENT_MS            10
+#define DISPLAY_REFRESH_TIME_MS    1000
+#define MESSAGE_HOLD_TIME_MS       1500
+#define NUMBER_OF_AVG_SAMPLES       100
+#define TEMP_LIMIT_C               30.0f
+#define DEACTIVATION_CODE_LENGTH      5
+
+AnalogIn lm35SensorPin( A1 );
+DigitalIn gasSensorPin( PE_12 );
+DigitalInOut buzzerPin( PE_10 );
+DigitalOut alarmLed( LED1 );
+
+static const char deactivationCode[DEACTIVATION_CODE_LENGTH + 1] = "12345";
+static char enteredCode[DEACTIVATION_CODE_LENGTH + 1] = "";
+static int enteredCodeIndex = 0;
+static bool alarmLatched = OFF;
+static bool lastHazardState = false;
+static int displayRefreshAccumulator = 0;
+static int messageHoldAccumulator = 0;
+static bool temporaryMessageActive = false;
+static float lm35ReadingsArray[NUMBER_OF_AVG_SAMPLES];
+static int lm35SampleIndex = 0;
+
+static void lm35ReadingsArrayInit();
+static float analogReadingScaledWithTheLM35Formula( float analogReading );
+static float readTemperatureC();
+static bool gasDetectedRead();
+static bool overTemperatureRead();
+static void buzzerOn();
+static void buzzerOff();
+static void displayWriteLine( int y, const char * text );
+static void displayBaseScreen( float temperatureC, bool gasDetected, bool alarmState );
+static void displayCodeLine();
+static void displayPromptLine();
+static void displayTemporaryMessage( const char * text );
+static void clearEnteredCode();
+static bool isNumericKey( char keyReleased );
+static bool enteredCodeIsCorrect();
+
+static void lm35ReadingsArrayInit()
+{
+    for ( int i = 0; i < NUMBER_OF_AVG_SAMPLES; i++ ) {
+        lm35ReadingsArray[i] = 0.0f;
+    }
+}
+
+static float analogReadingScaledWithTheLM35Formula( float analogReading )
+{
+    return ( analogReading * 3.3f / 0.01f );
+}
+
+static float readTemperatureC()
+{
+    float sum = 0.0f;
+    float average = 0.0f;
+
+    lm35ReadingsArray[lm35SampleIndex] = lm35SensorPin.read();
+    lm35SampleIndex++;
+
+    if ( lm35SampleIndex >= NUMBER_OF_AVG_SAMPLES ) {
+        lm35SampleIndex = 0;
+    }
+
+    for ( int i = 0; i < NUMBER_OF_AVG_SAMPLES; i++ ) {
+        sum += lm35ReadingsArray[i];
+    }
+
+    average = sum / NUMBER_OF_AVG_SAMPLES;
+    return analogReadingScaledWithTheLM35Formula( average );
+}
+
+static bool gasDetectedRead()
+{
+    return ( gasSensorPin.read() == 0 );
+}
+
+static bool overTemperatureRead()
+{
+    return ( readTemperatureC() >= TEMP_LIMIT_C );
+}
+
+static void buzzerOn()
+{
+    buzzerPin.output();
+    buzzerPin = LOW;
+}
+
+static void buzzerOff()
+{
+    buzzerPin.input();
+}
+
+static void displayWriteLine( int y, const char * text )
+{
+    char formattedLine[21];
+    int i = 0;
+
+    while ( text[i] != '\0' && i < 20 ) {
+        formattedLine[i] = text[i];
+        i++;
+    }
+
+    while ( i < 20 ) {
+        formattedLine[i] = ' ';
+        i++;
+    }
+
+    formattedLine[20] = '\0';
+
+    displayCharPositionWrite( 0, y );
+    displayStringWrite( formattedLine );
+}
+
+static void displayBaseScreen( float temperatureC, bool gasDetected, bool alarmState )
+{
+    char line0[21];
+    char line1[21];
+    char line2[21];
+
+    std::snprintf( line0, sizeof(line0), "Temperature: %2.1fC", temperatureC );
+    std::snprintf( line1, sizeof(line1), "Gas: %s", gasDetected ? "Detected" : "Not Detected" );
+    std::snprintf( line2, sizeof(line2), "Alarm: %s", alarmState ? "ON" : "OFF" );
+
+    displayWriteLine( 0, line0 );
+    displayWriteLine( 1, line1 );
+    displayWriteLine( 2, line2 );
+}
+
+static void displayCodeLine()
+{
+    char line[21];
+    char maskedCode[10] = "_ _ _ _ _";
+    int i;
+
+    for ( i = 0; i < enteredCodeIndex && i < DEACTIVATION_CODE_LENGTH; i++ ) {
+        maskedCode[i * 2] = enteredCode[i];
+    }
+
+    std::snprintf( line, sizeof(line), "Code:%s", maskedCode );
+    displayWriteLine( 3, line );
+}
+
+static void displayPromptLine()
+{
+    displayWriteLine( 3, "4=Gas  5=Temp" );
+}
+
+static void displayTemporaryMessage( const char * text )
+{
+    displayWriteLine( 3, text );
+    temporaryMessageActive = true;
+    messageHoldAccumulator = 0;
+}
+
+static void clearEnteredCode()
+{
+    for ( int i = 0; i < DEACTIVATION_CODE_LENGTH + 1; i++ ) {
+        enteredCode[i] = '\0';
+    }
+    enteredCodeIndex = 0;
+}
+
+static bool isNumericKey( char keyReleased )
+{
+    return ( keyReleased >= '0' && keyReleased <= '9' );
+}
+
+static bool enteredCodeIsCorrect()
+{
+    return ( std::strcmp( enteredCode, deactivationCode ) == 0 );
+}
+
+int main()
+{
+    char keyReleased = '\0';
+    float temperatureC = 0.0f;
+    bool gasDetected = false;
+    bool overTemperature = false;
+    bool currentHazardState = false;
+
+    displayInit( DISPLAY_CONNECTION_I2C_PCF8574_IO_EXPANDER );
+    matrixKeypadInit( TIME_INCREMENT_MS );
+
+    lm35ReadingsArrayInit();
+    buzzerOff();
+    alarmLed = OFF;
+    clearEnteredCode();
+
+    displayWriteLine( 0, "Enter Code to" );
+    displayWriteLine( 1, "Deactivate Alarm" );
+    displayWriteLine( 2, "Alarm: OFF" );
+    displayPromptLine();
+
+    while ( true ) {
+
+        temperatureC = readTemperatureC();
+        gasDetected = gasDetectedRead();
+        overTemperature = ( temperatureC >= TEMP_LIMIT_C );
+        currentHazardState = ( gasDetected || overTemperature );
+
+        if ( !lastHazardState && currentHazardState ) {
+            alarmLatched = ON;
+
+            if ( gasDetected ) {
+                displayTemporaryMessage( "WARNING: GAS!" );
+            } else if ( overTemperature ) {
+                displayTemporaryMessage( "WARNING: TEMP!" );
+            }
+        }
+
+        lastHazardState = currentHazardState;
+
+        if ( alarmLatched ) {
+            buzzerOn();
+            alarmLed = ON;
+        } else {
+            buzzerOff();
+            alarmLed = OFF;
+        }
+
+        keyReleased = matrixKeypadUpdate();
+
+        if ( keyReleased != '\0' ) {
+
+            if ( alarmLatched ) {
+
+                if ( isNumericKey( keyReleased ) ) {
+
+                    if ( enteredCodeIndex < DEACTIVATION_CODE_LENGTH ) {
+                        enteredCode[enteredCodeIndex] = keyReleased;
+                        enteredCodeIndex++;
+                        enteredCode[enteredCodeIndex] = '\0';
+                    }
+
+                    displayBaseScreen( temperatureC, gasDetected, alarmLatched );
+                    displayCodeLine();
+
+                    if ( enteredCodeIndex >= DEACTIVATION_CODE_LENGTH ) {
+
+                        if ( enteredCodeIsCorrect() ) {
+                            alarmLatched = OFF;
+                            clearEnteredCode();
+                            buzzerOff();
+                            alarmLed = OFF;
+                            displayTemporaryMessage( "Code OK Alarm OFF" );
+                        } else {
+                            clearEnteredCode();
+                            displayTemporaryMessage( "Wrong Code" );
+                        }
+                    }
+                }
+
+            } else {
+
+                if ( keyReleased == '4' ) {
+                    displayTemporaryMessage( gasDetected ? "Gas: Detected" : "Gas: Not Detected" );
+                } else if ( keyReleased == '5' ) {
+                    displayTemporaryMessage( overTemperature ? "Temp: HIGH" : "Temp: NORMAL" );
+                }
+            }
+        }
+
+        if ( displayRefreshAccumulator >= DISPLAY_REFRESH_TIME_MS ) {
+            displayRefreshAccumulator = 0;
+
+            displayBaseScreen( temperatureC, gasDetected, alarmLatched );
+
+            if ( !temporaryMessageActive ) {
+                if ( alarmLatched ) {
+                    displayCodeLine();
+                } else {
+                    displayPromptLine();
+                }
+            }
+        } else {
+            displayRefreshAccumulator += TIME_INCREMENT_MS;
+        }
+
+        if ( temporaryMessageActive ) {
+            if ( messageHoldAccumulator >= MESSAGE_HOLD_TIME_MS ) {
+                messageHoldAccumulator = 0;
+                temporaryMessageActive = false;
+
+                if ( alarmLatched ) {
+                    displayCodeLine();
+                } else {
+                    displayPromptLine();
+                }
+            } else {
+                messageHoldAccumulator += TIME_INCREMENT_MS;
+            }
+        }
+
+        delay( TIME_INCREMENT_MS );
+    }
+}
