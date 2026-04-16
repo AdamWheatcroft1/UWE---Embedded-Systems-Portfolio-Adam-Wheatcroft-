@@ -1,0 +1,310 @@
+#include "mbed.h"
+#include "sd_card.h"
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+
+#define LOOP_DELAY_MS            200
+#define TEMP_THRESHOLD_C         25.0f
+#define TEMP_RESET_C             24.0f
+#define GAS_THRESHOLD_PPM        170.0f
+#define GAS_RESET_PPM            160.0f
+#define ALERT_COOLDOWN_TICKS     15   
+#define KEYPAD_ROW1              PB_3
+#define KEYPAD_ROW2              PB_5
+#define KEYPAD_ROW3              PC_7
+#define KEYPAD_ROW4              PA_15
+#define KEYPAD_COL1              PB_12
+#define KEYPAD_COL2              PB_13
+#define KEYPAD_COL3              PB_15
+#define KEYPAD_COL4              PC_6
+#define LM35_PIN                 A1
+#define GAS_SENSOR_PIN           A2
+#define LOG_FILE_NAME            "log.txt"
+
+typedef enum {
+    MODE_NONE = 0,
+    MODE_TEMP,
+    MODE_GAS
+} monitorMode_t;
+
+AnalogIn mainLm35Input(LM35_PIN);
+AnalogIn mainGasSensorInput(GAS_SENSOR_PIN);
+
+DigitalOut keypadRow1(KEYPAD_ROW1);
+DigitalOut keypadRow2(KEYPAD_ROW2);
+DigitalOut keypadRow3(KEYPAD_ROW3);
+DigitalOut keypadRow4(KEYPAD_ROW4);
+
+DigitalIn keypadCol1(KEYPAD_COL1, PullDown);
+DigitalIn keypadCol2(KEYPAD_COL2, PullDown);
+DigitalIn keypadCol3(KEYPAD_COL3, PullDown);
+DigitalIn keypadCol4(KEYPAD_COL4, PullDown);
+
+static monitorMode_t selectedMode = MODE_NONE;
+static bool sdAvailable = false;
+
+static bool tempAlertLatched = false;
+static bool gasAlertLatched  = false;
+
+static int tempCooldownTicks = ALERT_COOLDOWN_TICKS;
+static int gasCooldownTicks  = ALERT_COOLDOWN_TICKS;
+
+static unsigned int nextAlertNumber = 1;
+
+static void keypadRowsOff();
+static char keypadRead();
+static float readTemperatureC();
+static float readGasLevelPpm();
+static void printMenu();
+static void selectMode(monitorMode_t newMode, const char* message);
+static void handleTemperatureMode();
+static void handleGasMode();
+static void readStoredAlertsFromSd();
+static unsigned int findNextAlertNumberFromSd();
+
+static void keypadRowsOff()
+{
+    keypadRow1 = 0;
+    keypadRow2 = 0;
+    keypadRow3 = 0;
+    keypadRow4 = 0;
+}
+
+static char keypadRead()
+{
+    DigitalOut* rows[4] = { &keypadRow1, &keypadRow2, &keypadRow3, &keypadRow4 };
+    DigitalIn* cols[4]  = { &keypadCol1, &keypadCol2, &keypadCol3, &keypadCol4 };
+
+    const char keypadMap[4][4] = {
+        { '1', '2', '3', 'A' },
+        { '4', '5', '6', 'B' },
+        { '7', '8', '9', 'C' },
+        { '*', '0', '#', 'D' }
+    };
+
+    for (int r = 0; r < 4; r++) {
+        keypadRowsOff();
+        *rows[r] = 1;
+        wait_us(3000);
+
+        for (int c = 0; c < 4; c++) {
+            if (cols[c]->read()) {
+                ThisThread::sleep_for(std::chrono::milliseconds(30));
+
+                if (cols[c]->read()) {
+                    char pressedKey = keypadMap[r][c];
+
+                    int releaseTimeout = 0;
+                    while (cols[c]->read() && (releaseTimeout < 100)) {
+                        ThisThread::sleep_for(std::chrono::milliseconds(10));
+                        releaseTimeout++;
+                    }
+
+                    keypadRowsOff();
+                    return pressedKey;
+                }
+            }
+        }
+    }
+
+    keypadRowsOff();
+    return '\0';
+}
+
+static float readTemperatureC()
+{
+    const int samples = 20;
+    float total = 0.0f;
+
+    for (int i = 0; i < samples; i++) {
+        total += mainLm35Input.read();
+        ThisThread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    float averageReading = total / samples;
+    float voltage = averageReading * 3.3f;
+    float temperatureC = voltage * 100.0f;
+
+    return temperatureC;
+}
+
+static float readGasLevelPpm()
+{
+    const int samples = 20;
+    float total = 0.0f;
+
+    for (int i = 0; i < samples; i++) {
+        total += mainGasSensorInput.read();
+        ThisThread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    float averageReading = total / samples;
+    float gasPpm = averageReading * 800.0f;
+
+    return gasPpm;
+}
+
+static void printMenu()
+{
+    printf("\r\nSelect sensor to monitor:\r\n");
+    printf("Press A for Temperature\r\n");
+    printf("Press B for Gas\r\n");
+    printf("Press * to read all logged alerts\r\n\r\n");
+}
+
+static void selectMode(monitorMode_t newMode, const char* message)
+{
+    selectedMode = newMode;
+
+    tempAlertLatched = false;
+    gasAlertLatched  = false;
+
+    tempCooldownTicks = ALERT_COOLDOWN_TICKS;
+    gasCooldownTicks  = ALERT_COOLDOWN_TICKS;
+
+    printf("%s\r\n", message);
+}
+
+static unsigned int findNextAlertNumberFromSd()
+{
+    FILE *file = fopen("/sd/" LOG_FILE_NAME, "r");
+    if (file == NULL) {
+        return 1;
+    }
+
+    char line[128];
+    unsigned int parsedNumber = 0;
+    unsigned int lastNumber = 0;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        if (sscanf(line, "Alert %u", &parsedNumber) == 1) {
+            if (parsedNumber > lastNumber) {
+                lastNumber = parsedNumber;
+            }
+        }
+    }
+
+    fclose(file);
+    return lastNumber + 1;
+}
+
+static void readStoredAlertsFromSd()
+{
+    FILE *file = fopen("/sd/" LOG_FILE_NAME, "r");
+
+    if (file == NULL) {
+        printf("No stored alerts found or file could not be opened.\r\n");
+        return;
+    }
+
+    printf("\r\n===== STORED ALERTS =====\r\n");
+
+    char line[128];
+    while (fgets(line, sizeof(line), file) != NULL) {
+        printf("%s", line);
+    }
+
+    printf("===== END OF ALERTS =====\r\n\r\n");
+
+    fclose(file);
+}
+
+static void handleTemperatureMode()
+{
+    char logLine[128];
+    float temperatureC = readTemperatureC();
+
+    printf("Temp reading: %.2f C\r\n", temperatureC);
+
+    if ((temperatureC >= TEMP_THRESHOLD_C) && (!tempAlertLatched)) {
+
+        snprintf(logLine,
+                 sizeof(logLine),
+                 "Alert %u | Temp = %.2f C\r\n",
+                 nextAlertNumber,
+                 temperatureC);
+
+        printf("Alert Logged: Temp = %.2f C\r\n", temperatureC);
+
+        if (sdAvailable) {
+            sdCardWriteFile(LOG_FILE_NAME, logLine);
+        }
+
+        nextAlertNumber++;
+        tempAlertLatched = true;
+    }
+    else if (temperatureC <= TEMP_RESET_C) {
+        tempAlertLatched = false;
+    }
+}
+
+static void handleGasMode()
+{
+    char logLine[128];
+    float gasPpm = readGasLevelPpm();
+
+    printf("Gas reading: %.2f ppm\r\n", gasPpm);
+
+    if ((gasPpm >= GAS_THRESHOLD_PPM) && (!gasAlertLatched)) {
+
+        snprintf(logLine,
+                 sizeof(logLine),
+                 "Alert %u | Gas = %.2f ppm\r\n",
+                 nextAlertNumber,
+                 gasPpm);
+
+        printf("Alert Logged: Gas = %.2f ppm\r\n", gasPpm);
+
+        if (sdAvailable) {
+            sdCardWriteFile(LOG_FILE_NAME, logLine);
+        }
+
+        nextAlertNumber++;
+        gasAlertLatched = true;
+    }
+    else if (gasPpm <= GAS_RESET_PPM) {
+        gasAlertLatched = false;
+    }
+}
+
+int main()
+{
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("\r\nMain Task 8 SD Card Logger Starting...\r\n");
+
+    sdAvailable = sdCardInit();
+
+    if (sdAvailable) {
+        nextAlertNumber = findNextAlertNumberFromSd();
+        printf("SD card ready.\r\n");
+    } else {
+        printf("Warning: SD card not available.\r\n");
+    }
+
+    printMenu();
+
+    while (true) {
+        char keyPressed = keypadRead();
+
+        if (keyPressed == 'A') {
+            selectMode(MODE_TEMP, "Temperature monitoring selected.");
+        }
+        else if (keyPressed == 'B') {
+            selectMode(MODE_GAS, "Gas monitoring selected.");
+        }
+        else if (keyPressed == '*') {
+            readStoredAlertsFromSd();
+        }
+
+        if (selectedMode == MODE_TEMP) {
+            handleTemperatureMode();
+        }
+        else if (selectedMode == MODE_GAS) {
+            handleGasMode();
+        }
+
+        ThisThread::sleep_for(std::chrono::milliseconds(LOOP_DELAY_MS));
+    }
+}
