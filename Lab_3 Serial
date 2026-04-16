@@ -1,0 +1,133 @@
+#include "mbed.h"
+#include <cstring>   
+
+UnbufferedSerial uartUsb(USBTX, USBRX, 115200);
+
+DigitalIn sw1(D2, PullDown);   
+DigitalIn sw2(D3, PullDown);   
+DigitalIn sw3(D4, PullDown);   
+DigitalIn sw4(D5, PullDown);   
+DigitalIn sw5(D6, PullDown);   
+DigitalIn sw6(D7, PullDown);   
+
+bool gasActive = false;
+bool tempActive = false;
+bool monitoringEnabled = false;
+
+Timer monitorTimer;
+
+void uartPrint(const char *msg)
+{
+    uartUsb.write(msg, strlen(msg));
+    uartUsb.write("\r\n", 2);
+}
+
+void sendGasState()
+{
+    if (gasActive)
+        uartPrint("GAS ALARM ACTIVE");
+    else
+        uartPrint("GAS ALARM CLEAR");
+}
+
+void sendTempState()
+{
+    if (tempActive)
+        uartPrint("TEMP ALARM ACTIVE");
+    else
+        uartPrint("TEMP ALARM CLEAR");
+}
+
+void sendStatus()
+{
+    if (gasActive)
+        uartUsb.write("GAS=ACTIVE ", 11);
+    else
+        uartUsb.write("GAS=CLEAR ", 10);
+
+    if (tempActive)
+        uartUsb.write("TEMP=ACTIVE", 11);
+    else
+        uartUsb.write("TEMP=CLEAR", 10);
+
+    uartUsb.write("\r\n", 2);
+}
+
+int main()
+{
+    uartPrint("Lab 3 - Main Task 3 Ready");
+
+    monitorTimer.start();
+
+    while (true)
+    {
+
+        if (sw1.read() == 1)
+        {
+            gasActive = !gasActive;
+
+            if (gasActive)
+                uartPrint("WARNING: GAS DETECTED");
+
+            sendGasState();
+            ThisThread::sleep_for(200ms);   
+        }
+
+        if (sw2.read() == 1)
+        {
+            sendGasState();
+            ThisThread::sleep_for(200ms);
+        }
+
+        if (sw3.read() == 1)
+        {
+            sendTempState();
+            ThisThread::sleep_for(200ms);
+        }
+
+        if (sw4.read() == 1)
+        {
+            tempActive = !tempActive;
+
+            if (tempActive)
+                uartPrint("WARNING: TEMPERATURE TOO HIGH");
+
+            sendTempState();
+            ThisThread::sleep_for(200ms);
+        }
+
+        if (sw5.read() == 1)
+        {
+            gasActive = false;
+            tempActive = false;
+            uartPrint("ALARMS RESET");
+            ThisThread::sleep_for(200ms);
+        }
+
+        if (sw6.read() == 1)
+        {
+            monitoringEnabled = !monitoringEnabled;
+
+            if (monitoringEnabled)
+            {
+                uartPrint("MONITORING MODE ON");
+                monitorTimer.reset();     
+            }
+            else
+            {
+                uartPrint("MONITORING MODE OFF");
+            }
+
+            ThisThread::sleep_for(200ms);
+        }
+
+        if (monitoringEnabled)
+        {
+            if (monitorTimer.elapsed_time() >= 2s)
+            {
+                sendStatus();
+                monitorTimer.reset();
+            }
+        }
+    }
+}
